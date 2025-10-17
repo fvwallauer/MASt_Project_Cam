@@ -3,6 +3,8 @@
 venv
 env
 .env
+.venv_mast
+.venv_proj
 
 # Conda environment folder name (replace with your environment name if it's in the repo)
 mast_proj 
