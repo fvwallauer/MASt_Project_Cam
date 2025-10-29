@@ -3,7 +3,8 @@
 venv
 env
 .env
-.venv_mast
+.venv_project/
+MASt_Project.code-workspace
 .venv_proj
 .DS_Store
 *.png
