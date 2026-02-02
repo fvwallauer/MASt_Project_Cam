@@ -54,14 +54,14 @@ def rand_targets(R, n):
     R = radius of disc
     n = number of targets to generate
     """
-    key = jax.random.PRNGKey(0)
-    key_p, key_q = jax.random.split(key)
-    p = jax.random.uniform(key_p, shape=(n,))
-    q = jax.random.uniform(key_q, shape=(n,))
-    r = R * jnp.sqrt(p)
-    theta = 2*jnp.pi*q
-
-    return r * jnp.cos(theta), r * jnp.sin(theta)
+    rng = np.random.default_rng(0)
+    p = rng.random(n)
+    q = rng.random(n)
+    rr = R * np.sqrt(p)
+    theta = 2*np.pi*q
+    x = rr * np.cos(theta)
+    y = rr * np.sin(theta)
+    return jnp.asarray(x), jnp.asarray(y)
 
 # Indexing: assigning fibre IDs based on retractor and tier IDs
 def fibre_id(retractor_id, tier_id): # Fibre ID from retractor & tier id
