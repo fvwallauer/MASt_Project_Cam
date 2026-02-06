@@ -615,3 +615,545 @@ collision_kind = jnp.where(
 print('Always:', len(jnp.where(collision_kind == 1)[0])/2)
 print('Never:', len(jnp.where(collision_kind == -1)[0])/2)
 print('Sometimes:', len(jnp.where(collision_kind == 0)[0])/2)
+
+# Calculate the energy per fibre allocation
+F, T = allowed.shape
+rng = np.random.default_rng(42)
+priorities = np.ones(T)
+high_frac = 0.55 # fraction of high-priority targets
+high_idx = rng.choice(np.arange(T), size=int(high_frac*T), replace=False) # get indicese of random high-priority targets, replace=False => select without replacement
+priorities[high_idx] = 10.0  # high-priority targets
+
+@jax.jit
+def compute_energies_ft(px, py, retractor_x, retractor_y, n_tiers, phi_max, allowed, priorities):
+    """
+    Returns energy per fibre-target combination (F,T). Unreachable pairs are +inf.
+    energy = (1 + s) / priority (Hughes, 2022)
+    s = straightness of each fibre, s << 1
+    """
+    F, T = allowed.shape # n_fibres, n_targets
+    fibre_ids = jnp.arange(F)      # (F,)
+    r_ids = fibre_ids // n_tiers          # (F,)
+    t_ids = fibre_ids % n_tiers           # (F,)
+
+    rx = retractor_x[r_ids]               # (F,)
+    ry = retractor_y[r_ids]               # (F,)
+    tier_span = fibre_span_allowed[t_ids] # (F,) / FOR EACH FIBRE
+
+    pos_r = jnp.stack([rx, ry], axis=1)  # (F,2) (x,y) pos. for each retractor
+    pos_r_norm_inward = - pos_r / jnp.linalg.norm(pos_r, axis=1, keepdims=True) # (F,) : unit vector in retractor-origin direction
+
+    vx = px[None, :] - rx[:, None]     # (F, T) Broadcast dimensions!! So cool!
+    vy = py[None, :] - ry[:, None]     # (F, T)
+    v_len = jnp.sqrt(vx**2 + vy**2) + 1e-12   # (F, T)
+
+    ux = vx / v_len   # (F, T)
+    uy = vy / v_len   # (F, T)
+
+    # Dot product between norm (inward) from retractor & unit vector from retractor to target
+    dot = (ux * pos_r_norm_inward[:, 0:1] + uy * pos_r_norm_inward[:, 1:2])     # (F, T)
+
+    # Angle between norm @ rectractor & vector to target
+    dot = jnp.clip(dot, -1.0, 1.0)  # numerical safety
+    ang = jnp.arccos(dot)       # (F, T)
+
+    # straightness penalty (small)
+    s = 0.1 * (ang / phi_max) # (F,T) # GUESS AT THE PENALTY?
+
+    # unreachable => inf. so we never choose it!
+    s = jnp.where(allowed, s, jnp.inf)
+
+    energy_ft = (1.0 + s) / priorities[None, :]  # broadcast priorities over fibres
+    # minimize energy_ft by having SMALL s, i.e. phi_max >> ang
+    return energy_ft
+
+energies_ft_j = compute_energies_ft(px, py, retractor_x, retractor_y, n_tiers, phi_max, allowed, priorities)
+
+# ============================================================
+# MISZALSKI/WEAVE-STYLE SA (plugs into your existing variables)
+# ============================================================
+
+import numpy as np
+
+# ----------------------------
+# Step A: Build pivot->reachable-targets padded lists (from allowed_np)
+# ----------------------------
+def build_reach_targets_per_pivot(allowed_np: np.ndarray):
+    F, T = allowed_np.shape
+    reach_lists = [np.where(allowed_np[f])[0].astype(np.int32) for f in range(F)]
+    Kp = max((len(x) for x in reach_lists), default=0)
+
+    reach_targets = -np.ones((F, Kp), dtype=np.int32)
+    reach_mask = np.zeros((F, Kp), dtype=bool)
+
+    for f, lst in enumerate(reach_lists):
+        n = len(lst)
+        if n:
+            reach_targets[f, :n] = lst
+            reach_mask[f, :n] = True
+
+    print("[A] reach_targets shape:", reach_targets.shape, "Kp(max targets per fibre)=", Kp)
+    print("[A] mean reachable targets per fibre:", np.mean(reach_mask.sum(axis=1)))
+    return reach_targets, reach_mask
+
+
+# ----------------------------
+# Step B: Build a fast global-fibre -> local-index lookup per target
+#         to interpret your compressed collision blocks correctly.
+# ----------------------------
+def build_local_index_map(target_fibre_ids: np.ndarray, n_fibres: int):
+    """
+    local_index[t, f] = k where f is the k-th fibre in the compressed list for target t,
+    or -1 if fibre f is not reachable for target t.
+    """
+    T, max_F = target_fibre_ids.shape
+    local_index = -np.ones((T, n_fibres), dtype=np.int16)
+
+    for t in range(T):
+        ids = target_fibre_ids[t]
+        valid = ids >= 0
+        # compressed ordering is exactly the order in reachable_fibres_per_target (i.e. ids[valid])
+        # we set local index k in [0..Fi-1]
+        fibs = ids[valid]
+        for k, f in enumerate(fibs):
+            local_index[t, int(f)] = k
+
+    print("[B] local_index shape:", local_index.shape)
+    # quick sanity: for a random target, check first reachable fibre maps to k=0
+    t0 = np.random.randint(0, T)
+    first = target_fibre_ids[t0][target_fibre_ids[t0] >= 0]
+    if len(first):
+        f0 = int(first[0])
+        assert local_index[t0, f0] == 0
+    return local_index
+
+
+# ----------------------------
+# Step C: Collision oracle using YOUR collision_kind + collision_matrix
+# ----------------------------
+always_collide_np = np.array(always_collide_mat, dtype=bool)
+needs_fibre_level_np = np.array(needs_fibre_level, dtype=bool)
+
+def pair_key(t1: int, t2: int):
+    return (t1, t2) if t1 < t2 else (t2, t1)
+
+def collides(f1: int, t1: int, f2: int, t2: int, local_index: np.ndarray) -> bool:
+    """
+    True if (f1->t1) and (f2->t2) conflict.
+    Uses:
+      - always_collide (button overlap unavoidable)
+      - needs_fibre_level -> consult collision_matrix compressed block
+      - otherwise -> no collision
+    """
+    if t1 == t2:
+        return True  # two fibres can't share a target
+
+    a, b = pair_key(t1, t2)
+
+    if always_collide_np[a, b]:
+        return True
+
+    if not needs_fibre_level_np[a, b]:
+        return False
+
+    block = collision_matrix.get((a, b), None)
+    if block is None:
+        # Should be rare: needs_fibre_level True but no block stored (e.g. build skipped)
+        # Be conservative or permissive; I choose conservative False here to avoid killing yield.
+        return False
+
+    i1 = int(local_index[a, f1]) if t1 == a else int(local_index[b, f1])
+    i2 = int(local_index[b, f2]) if t2 == b else int(local_index[a, f2])
+
+    if i1 < 0 or i2 < 0:
+        # should not happen if reachability and target_fibre_ids consistent
+        return False
+
+    # block is stored in (a,b) orientation with compressed indices:
+    #   rows correspond to fibres that reach target a
+    #   cols correspond to fibres that reach target b
+    if t1 == a and t2 == b:
+        return bool(block[i1, i2])
+    elif t1 == b and t2 == a:
+        return bool(block[i2, i1])
+    else:
+        # logically impossible due to a,b definition
+        return False
+
+
+# ----------------------------
+# Step D: State + invariants
+# ----------------------------
+def validate_bijection(pivot_to_target: np.ndarray, target_to_pivot: np.ndarray):
+    F = pivot_to_target.shape[0]
+    seen = set()
+    for f in range(F):
+        t = int(pivot_to_target[f])
+        if t >= 0:
+            assert int(target_to_pivot[t]) == f
+            assert t not in seen
+            seen.add(t)
+
+def count_alloc(pivot_to_target: np.ndarray) -> int:
+    return int(np.sum(pivot_to_target >= 0))
+
+
+# ----------------------------
+# Step E: Energy handling (WEAVE Configure-style table you already compute)
+# ----------------------------
+energies_ft = np.array(energies_ft_j)  # (F,T) numpy; inf for unreachable
+
+def total_energy(pivot_to_target: np.ndarray) -> float:
+    e = 0.0
+    for f, t in enumerate(pivot_to_target):
+        t = int(t)
+        if t >= 0:
+            e += float(energies_ft[f, t])
+    return e
+
+def delta_energy(pivot_to_target: np.ndarray, moves: list[tuple[int,int]]) -> float:
+    dE = 0.0
+    for f, t_new in moves:
+        t_old = int(pivot_to_target[f])
+        if t_old >= 0:
+            dE -= float(energies_ft[f, t_old])
+        if t_new >= 0:
+            dE += float(energies_ft[f, t_new])
+    return dE
+
+
+# ----------------------------
+# Step F: Collision check for proposed atomic moves (correctness-first)
+# ----------------------------
+def proposal_collision_free(pivot_to_target: np.ndarray, moves: list[tuple[int,int]], local_index: np.ndarray) -> bool:
+    """
+    Check all moved fibres against all allocated fibres under the proposed state.
+    O(#moves * #allocated), but fine for functionality-first.
+    """
+    # proposed target for moved fibres
+    proposed = {int(f): int(t) for f, t in moves}
+
+    def eff_target(f: int) -> int:
+        return proposed.get(f, int(pivot_to_target[f]))
+
+    F = pivot_to_target.shape[0]
+    moved = list(proposed.keys())
+
+    for f in moved:
+        t = eff_target(f)
+        if t < 0:
+            continue
+
+        # ensure target uniqueness (proposal should handle, but enforce here)
+        for g in moved:
+            if g != f and eff_target(g) == t:
+                return False
+
+        # check vs all other allocated fibres
+        for g in range(F):
+            if g == f:
+                continue
+            u = eff_target(g)
+            if u < 0:
+                continue
+            if collides(f, t, g, u, local_index):
+                return False
+
+    return True
+
+
+# ============================================================
+# Miszalski-style "four paths" proposal kernel
+# ============================================================
+
+def random_reachable_target(rng, reach_targets, reach_mask, f):
+    idx = np.where(reach_mask[f])[0]
+    if len(idx) == 0:
+        return -1
+    k = int(rng.choice(idx))
+    return int(reach_targets[f, k])
+
+def propose_four_paths(
+    rng,
+    fA: int,
+    pivot_to_target: np.ndarray,
+    target_to_pivot: np.ndarray,
+    reach_targets: np.ndarray,
+    reach_mask: np.ndarray,
+    local_index: np.ndarray,
+    max_reloc_tries: int = 32,
+):
+    """
+    Returns (ok, moves_list).
+    moves_list is a list of (pivot -> new_target) applied atomically.
+    Faithful structure to Miszalski: PivotA picks TargetB randomly; 4 cases depending
+    on whether PivotA and TargetB are allocated.
+    """
+    tA = int(pivot_to_target[fA])
+    tB = random_reachable_target(rng, reach_targets, reach_mask, fA)
+    if tB < 0:
+        return False, []
+
+    fB = int(target_to_pivot[tB])  # -1 if unallocated
+
+    # Case I: A free, B free -> assign A->B
+    if tA < 0 and fB < 0:
+        moves = [(fA, tB)]
+        if proposal_collision_free(pivot_to_target, moves, local_index):
+            return True, moves
+        return False, []
+
+    # Case II: A allocated, B free -> move A->B (old target becomes free)
+    if tA >= 0 and fB < 0:
+        moves = [(fA, tB)]
+        if proposal_collision_free(pivot_to_target, moves, local_index):
+            return True, moves
+        return False, []
+
+    # helper: relocate a pivot to a currently-free target
+    def try_relocate(pivot: int, reserved_targets: set[int], pre_moves: list[tuple[int,int]]):
+        idx = np.where(reach_mask[pivot])[0]
+        if len(idx) == 0:
+            return None
+        for _ in range(max_reloc_tries):
+            k = int(rng.choice(idx))
+            tC = int(reach_targets[pivot, k])
+            if tC < 0 or tC in reserved_targets:
+                continue
+            if int(target_to_pivot[tC]) != -1:
+                continue  # must be free to conserve yield
+            trial = pre_moves + [(pivot, tC)]
+            if proposal_collision_free(pivot_to_target, trial, local_index):
+                return tC
+        return None
+
+    # Case III: A free, B occupied -> A takes B; relocate B to free target C
+    if tA < 0 and fB >= 0:
+        pre = [(fA, tB)]
+        tC = try_relocate(fB, {tB}, pre)
+        if tC is None:
+            return False, []
+        moves = pre + [(fB, tC)]
+        return True, moves
+
+    # Case IV: A allocated, B occupied -> try swap; else A takes B and relocate B
+    if tA >= 0 and fB >= 0:
+        # try direct swap if fB can reach tA
+        # (reach_targets is padded; easiest check is membership in its valid set)
+        if np.any((reach_targets[fB] == tA) & reach_mask[fB]):
+            moves = [(fA, tB), (fB, tA)]
+            if proposal_collision_free(pivot_to_target, moves, local_index):
+                return True, moves
+
+        pre = [(fA, tB)]
+        tC = try_relocate(fB, {tB}, pre)
+        if tC is None:
+            return False, []
+        moves = pre + [(fB, tC)]
+        return True, moves
+
+    return False, []
+
+
+def apply_moves(pivot_to_target: np.ndarray, target_to_pivot: np.ndarray, moves: list[tuple[int,int]]):
+    """
+    Apply moves atomically and maintain bijection.
+    """
+    piv = pivot_to_target.copy()
+    tar = target_to_pivot.copy()
+
+    # unassign moved pivots
+    for f, _ in moves:
+        old = int(piv[f])
+        if old >= 0 and int(tar[old]) == f:
+            tar[old] = -1
+        piv[f] = -1
+
+    # assign new
+    for f, t in moves:
+        if t >= 0:
+            # target should be free; if not, clear (shouldn't happen if proposal correct)
+            if int(tar[t]) != -1:
+                other = int(tar[t])
+                piv[other] = -1
+            tar[t] = f
+            piv[f] = t
+
+    return piv, tar
+
+
+def metropolis_accept(rng, dE: float, T: float) -> bool:
+    if dE <= 0:
+        return True
+    x = -dE / max(T, 1e-12)
+    if x < -700:
+        return False
+    return float(rng.random()) < float(np.exp(x))
+
+
+# ============================================================
+# STEPWISE runnable SA driver
+# ============================================================
+
+def greedy_initial_state(reach_targets, reach_mask, local_index, seed=0):
+    """
+    Simple feasible start state: iterate fibres, pick best-energy reachable target that is free+collision-free.
+    """
+    rng = np.random.default_rng(seed)
+    F, T = energies_ft.shape
+    piv = -np.ones(F, dtype=np.int32)
+    tar = -np.ones(T, dtype=np.int32)
+
+    order = rng.permutation(F)
+    for f in order:
+        ts = reach_targets[f][reach_mask[f]]
+        if len(ts) == 0:
+            continue
+        # sort by energy
+        ts = ts[np.argsort(energies_ft[f, ts])]
+        for t in ts:
+            t = int(t)
+            if tar[t] != -1:
+                continue
+            moves = [(int(f), t)]
+            if proposal_collision_free(piv, moves, local_index):
+                piv, tar = apply_moves(piv, tar, moves)
+                break
+
+    validate_bijection(piv, tar)
+    E = total_energy(piv)
+    print("[INIT] allocated:", count_alloc(piv), "/", F, "energy:", E)
+    return piv, tar, E
+
+
+def anneal_miszalski_weave(
+    piv0, tar0, E0,
+    reach_targets, reach_mask, local_index,
+    Ti=1.0, Tf=1e-3, cooling_rate=0.02,
+    max_iters_per_T=5,
+    n_sweeps_cap=None,
+    seed=123,
+    verbose=True,
+):
+    """
+    Miszalski-style structure:
+      for each T:
+        repeat MaxIters:
+          traverse all pivots in random order:
+            pick random reachable TargetB
+            apply one of four paths
+            accept with Metropolis
+
+    Uses your WEAVE-style energy table energies_ft.
+    """
+    rng = np.random.default_rng(seed)
+    piv = piv0.copy()
+    tar = tar0.copy()
+    E = float(E0)
+    F = piv.shape[0]
+
+    Tcur = float(Ti)
+    temp_step = 0
+
+    while Tcur > Tf:
+        for _ in range(max_iters_per_T):
+            order = rng.permutation(F)
+            for fA in order:
+                ok, moves = propose_four_paths(
+                    rng,
+                    int(fA),
+                    piv, tar,
+                    reach_targets, reach_mask,
+                    local_index,
+                    max_reloc_tries=32
+                )
+                if not ok:
+                    continue
+                dE = delta_energy(piv, moves)
+                if metropolis_accept(rng, dE, Tcur):
+                    piv, tar = apply_moves(piv, tar, moves)
+                    E += dE
+
+        if verbose:
+            print(f"[SA] T={Tcur:.5g}  allocated={count_alloc(piv)}/{F}  energy={E:.4f}")
+
+        validate_bijection(piv, tar)
+
+        temp_step += 1
+        if n_sweeps_cap is not None and temp_step >= n_sweeps_cap:
+            break
+
+        Tcur *= (1.0 - cooling_rate)
+
+    return piv, tar, E
+
+
+# ============================================================
+# RUN IN ORDER: A -> F
+# ============================================================
+
+# A) reachability lists per fibre
+reach_targets, reach_mask = build_reach_targets_per_pivot(allowed_np)
+
+# B) local index mapping (target, global fibre) -> compressed index
+local_index = build_local_index_map(target_fibre_ids, n_fibres=allowed_np.shape[0])
+
+# C) quick collision sanity check
+# pick random stored collision block and confirm dimensions
+if len(collision_matrix) > 0:
+    (t1, t2), block = next(iter(collision_matrix.items()))
+    print("[C] example collision block key:", (t1, t2), "shape:", block.shape)
+
+# D) build an initial feasible configuration
+piv0, tar0, E0 = greedy_initial_state(reach_targets, reach_mask, local_index, seed=0)
+
+# E) run Miszalski/WEAVE-style SA
+pivF, tarF, EF = anneal_miszalski_weave(
+    piv0, tar0, E0,
+    reach_targets, reach_mask, local_index,
+    Ti=1.0, Tf=1e-3, cooling_rate=0.02,
+    max_iters_per_T=5,
+    seed=123,
+    verbose=True,
+)
+
+print("[FINAL] allocated:", count_alloc(pivF), "/", pivF.shape[0], "energy:", EF)
+
+# F) optional: posterior-like sampling at fixed Tf (Boltzmann at Tf)
+def sample_fixed_T(piv_start, tar_start, E_start, Tfixed=1e-3, n_burn=20, n_samples=50, thin=5, seed=456):
+    rng = np.random.default_rng(seed)
+    piv = piv_start.copy()
+    tar = tar_start.copy()
+    E = float(E_start)
+    F = piv.shape[0]
+
+    def one_sweep():
+        nonlocal piv, tar, E
+        order = rng.permutation(F)
+        for fA in order:
+            ok, moves = propose_four_paths(
+                rng, int(fA),
+                piv, tar,
+                reach_targets, reach_mask,
+                local_index
+            )
+            if not ok:
+                continue
+            dE = delta_energy(piv, moves)
+            if metropolis_accept(rng, dE, Tfixed):
+                piv, tar = apply_moves(piv, tar, moves)
+                E += dE
+
+    for _ in range(n_burn):
+        one_sweep()
+
+    samples = []
+    for _ in range(n_samples):
+        for _ in range(thin):
+            one_sweep()
+        samples.append(piv.copy())
+
+    return samples
+
+# samples = sample_fixed_T(pivF, tarF, EF, Tfixed=1e-3, n_burn=20, n_samples=50, thin=5)
+# print("[SAMPLES] collected:", len(samples))
