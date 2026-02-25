@@ -16,7 +16,7 @@ plt.rc('ytick', labelsize=15)
 # ===============================================
 # PLATE PARAMETERS
 # -----------------------------------------------
-n_retractors = 168
+n_retractors = 10 # 168
 r = 102.5 # mm, half of 205mm field
 n_tiers = 3
 n_fibres = n_retractors * n_tiers
@@ -43,7 +43,7 @@ min_sep = 2 # mm; min. distance of separation below which buttons overlap
 # -----------------------------------------------
 # FIELD PARAMETERS
 # -----------------------------------------------
-n_targets = 1400 # 1400
+n_targets = 40 # 1400
 
 # ===============================================
 
@@ -629,4 +629,5 @@ for k, (t1, t2) in enumerate(pairs):
 pair_index_j = jnp.array(pair_index_np)  # move lookup to device
 
 print("pair_index_j shape:", pair_index_j.shape)
+
 
