@@ -32,7 +32,8 @@ n_fibres = n_retractors * n_tiers
 angles = jnp.linspace(0, 2*jnp.pi, n_retractors, endpoint=False)  # placement of fibres
 retractor_x = jnp.asarray(r * jnp.cos(angles))
 retractor_y = jnp.asarray(r * jnp.sin(angles))
-fibre_span_allowed = jnp.asarray([r*0.4, r*0.7, r*1.3])  # for tiers 0,1,2 (low-high)
+# fibre_span_allowed = jnp.asarray([r*0.4, r*0.7, r*1.3])  # for tiers 0,1,2 (low-high)
+fibre_span_allowed = jnp.asarray([r*(180/102.5), r*(190/102.5) , r*(200/102.5)]) # for tiers 0,1,2 (low-high)
 phi_max = jnp.deg2rad(14)  # max bend angle
 
 # Button vertices in local fibre-target coordinates
@@ -500,12 +501,25 @@ for t in range(n_targets):
 
 # Collision lookup
 def collides(ti, si, tj, sj):
+    if ti == tj:
+        return False
+
+    # always-collide is symmetric so no special handling needed
     if always_collide_np[ti, tj]:
         return True
-    k = pair_index_np[ti, tj]
-    if k == -1:
-        return False
-    return bool(blocks_np[k, si, sj])
+
+    # Canonicalise the order to match how 'pairs' and 'blocks_np' were built (t1 < t2)
+    if ti < tj:
+        k = pair_index_np[ti, tj]
+        if k == -1:
+            return False
+        return bool(blocks_np[k, si, sj])
+    else:
+        k = pair_index_np[tj, ti]
+        if k == -1:
+            return False
+        # IMPORTANT: swap slot indices because blocks are stored as (t1 slots, t2 slots)
+        return bool(blocks_np[k, sj, si])
 
 def placement_valid(ti, si):
     for tj in range(n_targets):
