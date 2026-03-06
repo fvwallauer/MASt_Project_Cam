@@ -207,18 +207,93 @@ def always_collide(px, py, reachable_Ts, min_sep):
     always_c = jnp.where(jnp.eye(T, dtype=bool), False, always_c)
     return always_c
 
-def seg_seg_intersect(p, r, q, s):
-    cross = lambda a, b: a[..., 0]*b[..., 1] - a[..., 1]*b[..., 0]
-    rxs = cross(r, s)
+def seg_seg_intersect(p, r, q, s, eps=1e-9):
+    """
+    Input:
+        p, r, q, s are (..., 2) arrays representing segments
+        p -> p + r   and   q -> q + s
+
+    Output:
+        boolean array of shape (...) indicating whether the segments intersect.
+
+    This handles:
+      - ordinary crossings
+      - endpoint touching
+      - parallel but disjoint segments
+      - collinear overlapping segments
+    """
+    def cross(a, b):
+        return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+    def dot(a, b):
+        return a[..., 0] * b[..., 0] + a[..., 1] * b[..., 1]
+
     q_p = q - p
-    parallel = jnp.isclose(rxs, 0)
+    rxs = cross(r, s)
+    q_pxr = cross(q_p, r)
+
+    # Parallel and collinear tests
+    parallel = jnp.abs(rxs) < eps
+    collinear = parallel & (jnp.abs(q_pxr) < eps)
+
+    # -----------------------------
+    # 1) Non-parallel case
+    # -----------------------------
     rxs_safe = jnp.where(parallel, 1.0, rxs)
 
     t = cross(q_p, s) / rxs_safe
     u = cross(q_p, r) / rxs_safe
 
-    intersect = (~parallel) & (t >= 0) & (t <= 1) & (u >= 0) & (u <= 1)
-    return intersect
+    proper_intersect = (
+        (~parallel) &
+        (t >= 0.0) & (t <= 1.0) &
+        (u >= 0.0) & (u <= 1.0)
+    )
+
+    # -----------------------------
+    # 2) Collinear case
+    # -----------------------------
+    rr = dot(r, r)
+    ss = dot(s, s)
+
+    # Handle degenerate segments safely
+    rr_safe = jnp.where(rr < eps, 1.0, rr)
+    ss_safe = jnp.where(ss < eps, 1.0, ss)
+
+    # If both are points
+    p_is_point = rr < eps
+    q_is_point = ss < eps
+
+    same_point = p_is_point & q_is_point & (jnp.linalg.norm(p - q, axis=-1) < eps)
+
+    # If p-segment is a point, test whether p lies on q-segment
+    qp_dot_s = dot(p - q, s)
+    point_p_on_q = (
+        p_is_point & (~q_is_point) & collinear &
+        (qp_dot_s >= -eps) & (qp_dot_s <= ss + eps)
+    )
+
+    # If q-segment is a point, test whether q lies on p-segment
+    q_p_dot_r = dot(q_p, r)
+    point_q_on_p = (
+        q_is_point & (~p_is_point) & collinear &
+        (q_p_dot_r >= -eps) & (q_p_dot_r <= rr + eps)
+    )
+
+    # General collinear overlap: project q and q+s onto p->p+r
+    t0 = dot(q_p, r) / rr_safe
+    t1 = t0 + dot(s, r) / rr_safe
+
+    tmin = jnp.minimum(t0, t1)
+    tmax = jnp.maximum(t0, t1)
+
+    collinear_overlap = (
+        collinear &
+        (~p_is_point) & (~q_is_point) &
+        (tmax >= -eps) & (tmin <= 1.0 + eps)
+    )
+
+    return proper_intersect | same_point | point_p_on_q | point_q_on_p | collinear_overlap
 
 @jax.jit
 def compute_path_bboxes(px, py, retractor_x, retractor_y, r_id_for_fibre, allowed):
@@ -392,6 +467,14 @@ for t, fibs in enumerate(reachable_fibres_per_target):
     target_fibre_ids[t, :n]  = fibs[:n]
     target_fibre_mask[t, :n] = True
 
+slot_lookup = -np.ones((n_fibres, n_targets), dtype=np.int32)
+
+for t in range(n_targets):
+    valid = target_fibre_mask[t]
+    fibs = target_fibre_ids[t, valid]
+    slots = np.nonzero(valid)[0].astype(np.int32)
+    slot_lookup[fibs, t] = slots
+
 vertices_np = np.array(vertices)
 fibre_start_np = np.array(fibre_start)
 fibre_dir_np = np.array(fibre_dir)
@@ -419,7 +502,7 @@ pairs = np.stack([pairs_i, pairs_j], axis=1).astype(np.int32)
 
 print("Unique pairs needing fibre-level checks:", len(pairs))
 
-B = 256
+B = 32
 pairs_j_list = []
 blocks_j_list = []
 
@@ -457,10 +540,85 @@ pair_index_j = jnp.array(pair_index_np)
 print("pair_index_j shape:", pair_index_j.shape)
 
 # =============================================================================
+# SPARSE TARGET ADJACENCY: potential_conflicts[target]
+# =============================================================================
+def build_potential_conflicts(n_targets, pairs, always_collide_np):
+    """
+    For each target ti, return an array of targets tj such that:
+      - ti and tj always collide, or
+      - ti and tj have a fibre-level collision block in the sparse matrix.
+
+    This is the explicit sparse target graph induced by the collision matrix.
+    """
+    pot = [[] for _ in range(n_targets)]
+
+    # Fibre-level sparse pairs (pairs already contain only unique upper-triangular entries)
+    for t1, t2 in pairs:
+        t1 = int(t1)
+        t2 = int(t2)
+        pot[t1].append(t2)
+        pot[t2].append(t1)
+
+    # Always-collide pairs
+    ai, aj = np.where(np.triu(always_collide_np, k=1))
+    for t1, t2 in zip(ai, aj):
+        t1 = int(t1)
+        t2 = int(t2)
+        pot[t1].append(t2)
+        pot[t2].append(t1)
+
+    # Deduplicate and convert to compact arrays
+    pot = [np.array(sorted(set(lst)), dtype=np.int32) if len(lst) else np.empty(0, dtype=np.int32)
+           for lst in pot]
+    return pot
+
+
+def collides_many(ti, si, tj_arr, sj_arr):
+    if tj_arr.size == 0:
+        return np.zeros(0, dtype=bool)
+
+    out = always_collide_np[ti, tj_arr].copy()
+    mask = ~out
+    if not np.any(mask):
+        return out
+
+    tjv = tj_arr[mask]
+    sjv = sj_arr[mask]
+
+    lo = np.minimum(ti, tjv)
+    hi = np.maximum(ti, tjv)
+    kv = pair_index_np[lo, hi]
+
+    has_block = (kv != -1)
+    if not np.any(has_block):
+        return out
+
+    tjb = tjv[has_block]
+    sjb = sjv[has_block]
+    kb  = kv[has_block]
+
+    ti_first = (ti < tjb)
+
+    masked_result = np.zeros(tjv.shape[0], dtype=bool)
+
+    if np.any(ti_first):
+        masked_result[np.where(has_block)[0][ti_first]] = blocks_np[kb[ti_first], si, sjb[ti_first]]
+
+    if np.any(~ti_first):
+        masked_result[np.where(has_block)[0][~ti_first]] = blocks_np[kb[~ti_first], sjb[~ti_first], si]
+
+    out[mask] = masked_result
+    return out
+
+# =============================================================================
 # SA SETUP
 # =============================================================================
 always_collide_np = np.array(always_collide_mat)
 blocks_np = np.array(blocks_j)
+potential_conflicts = build_potential_conflicts(n_targets, pairs, always_collide_np)
+pc_sizes = np.array([len(x) for x in potential_conflicts], dtype=np.int32)
+print(f"Average potential_conflicts per target: {pc_sizes.mean():.2f}")
+print(f"Max potential_conflicts for any target: {pc_sizes.max()}")
 px_np = np.array(px)
 py_np = np.array(py)
 retractor_x_np = np.array(retractor_x)
@@ -504,11 +662,9 @@ def collides(ti, si, tj, sj):
     if ti == tj:
         return False
 
-    # always-collide is symmetric so no special handling needed
     if always_collide_np[ti, tj]:
         return True
 
-    # Canonicalise the order to match how 'pairs' and 'blocks_np' were built (t1 < t2)
     if ti < tj:
         k = pair_index_np[ti, tj]
         if k == -1:
@@ -518,32 +674,46 @@ def collides(ti, si, tj, sj):
         k = pair_index_np[tj, ti]
         if k == -1:
             return False
-        # IMPORTANT: swap slot indices because blocks are stored as (t1 slots, t2 slots)
         return bool(blocks_np[k, sj, si])
 
 def placement_valid(ti, si):
-    for tj in range(n_targets):
-        if target_to_fibre[tj] == -1 or tj == ti:
-            continue
-        sj = target_to_slot[tj]
-        if collides(ti, si, tj, sj):
-            return False
-    return True
+    pc = potential_conflicts[ti]
+    if pc.size == 0:
+        return True
+
+    assigned_mask = (target_to_fibre[pc] != -1)
+    if not np.any(assigned_mask):
+        return True
+
+    tj = pc[assigned_mask]
+    sj = target_to_slot[tj]
+
+    return not np.any(collides_many(ti, si, tj, sj))
+
 
 def placement_valid_excluding(ti, si, exclude):
-    for tj in range(n_targets):
-        if target_to_fibre[tj] == -1 or tj == ti or tj in exclude:
-            continue
-        sj = target_to_slot[tj]
-        if collides(ti, si, tj, sj):
-            return False
-    return True
+    pc = potential_conflicts[ti]
+    if pc.size == 0:
+        return True
+
+    assigned_mask = (target_to_fibre[pc] != -1)
+    if not np.any(assigned_mask):
+        return True
+
+    tj = pc[assigned_mask]
+
+    if exclude:
+        ex = np.fromiter(exclude, dtype=np.int32, count=len(exclude))
+        tj = tj[~np.isin(tj, ex)]
+        if tj.size == 0:
+            return True
+
+    sj = target_to_slot[tj]
+
+    return not np.any(collides_many(ti, si, tj, sj))
 
 def find_slot(fibre_id, target_id):
-    for s in range(max_F):
-        if target_fibre_mask[target_id, s] and target_fibre_ids[target_id, s] == fibre_id:
-            return s
-    return -1
+    return int(slot_lookup[fibre_id, target_id])
 
 # Assign/unassign
 def assign(f, t, s):
