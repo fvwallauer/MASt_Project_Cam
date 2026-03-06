@@ -827,7 +827,7 @@ def plot_assignment(snapshot, filename, title="Assignment"):
     ax.scatter(
         px_np[assigned_targets],
         py_np[assigned_targets],
-        s=12,
+        s=2,
         alpha=0.9,
         label="Assigned targets"
     )
@@ -836,7 +836,7 @@ def plot_assignment(snapshot, filename, title="Assignment"):
     ax.scatter(
         px_np[unassigned_targets],
         py_np[unassigned_targets],
-        s=8,
+        s=2,
         alpha=0.3,
         label="Unassigned targets"
     )
@@ -853,7 +853,7 @@ def plot_assignment(snapshot, filename, title="Assignment"):
         ax.plot(
             [start[0], end[0]],
             [start[1], end[1]],
-            linewidth=0.8,
+            linewidth=0.2,
             alpha=0.5
         )
 
@@ -863,7 +863,7 @@ def plot_assignment(snapshot, filename, title="Assignment"):
                 verts,
                 closed=True,
                 fill=False,
-                linewidth=0.8
+                linewidth=0.2
             )
         )
 
@@ -878,7 +878,7 @@ def plot_assignment(snapshot, filename, title="Assignment"):
     ax.set_title(f"{title}\nassigned fibres: {len(assigned_targets)}/{n_fibres}")
     ax.legend(loc="upper right", fontsize=10)
     fig.tight_layout()
-    fig.savefig(filename, dpi=200)
+    fig.savefig(filename)
     plt.close(fig)
 
 def plot_anneal_history(history, filename_prefix):
@@ -890,7 +890,7 @@ def plot_anneal_history(history, filename_prefix):
     ax.set_ylabel("Energy")
     ax.set_title("Energy during annealing")
     fig.tight_layout()
-    fig.savefig(f"{filename_prefix}_energy.png", dpi=200)
+    fig.savefig(f"{filename_prefix}_energy.pdf")
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(8, 4))
@@ -899,7 +899,7 @@ def plot_anneal_history(history, filename_prefix):
     ax.set_ylabel("Assigned fibres")
     ax.set_title("Assigned fibres during annealing")
     fig.tight_layout()
-    fig.savefig(f"{filename_prefix}_assigned.png", dpi=200)
+    fig.savefig(f"{filename_prefix}_assigned.pdf")
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(8, 4))
@@ -908,7 +908,7 @@ def plot_anneal_history(history, filename_prefix):
     ax.set_ylabel("Cumulative accepted swaps")
     ax.set_title("Accepted swaps during annealing")
     fig.tight_layout()
-    fig.savefig(f"{filename_prefix}_accepted.png", dpi=200)
+    fig.savefig(f"{filename_prefix}_accepted.pdf")
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(8, 4))
@@ -921,7 +921,7 @@ def plot_anneal_history(history, filename_prefix):
     ax.set_title("Move types accepted")
     ax.legend()
     fig.tight_layout()
-    fig.savefig(f"{filename_prefix}_swap_types.png", dpi=200)
+    fig.savefig(f"{filename_prefix}_swap_types.pdf")
     plt.close(fig)
 
     fig, ax = plt.subplots(figsize=(8, 4))
@@ -930,7 +930,7 @@ def plot_anneal_history(history, filename_prefix):
     ax.set_ylabel("Temperature")
     ax.set_title("Cooling schedule")
     fig.tight_layout()
-    fig.savefig(f"{filename_prefix}_temperature.png", dpi=200)
+    fig.savefig(f"{filename_prefix}_temperature.pdf")
     plt.close(fig)
 
 def plot_tier_counts(snapshot, filename, title="Tier composition"):
@@ -1119,23 +1119,23 @@ history = anneal(T_i=10.0, T_f=0.1, delta_T=0.01, max_iters=20, seed=123, return
 snap_final = snapshot_state()
 
 # Main configuration plots
-plot_assignment(snap_init, os.path.join(PLOT_DIR, "assignment_initial.png"), title="Initial greedy assignment")
-plot_assignment(snap_final, os.path.join(PLOT_DIR, "assignment_final.png"), title="Final annealed assignment")
+plot_assignment(snap_init, os.path.join(PLOT_DIR, "assignment_initial.pdf"), title="Initial greedy assignment")
+plot_assignment(snap_final, os.path.join(PLOT_DIR, "assignment_final.pdf"), title="Final annealed assignment")
 
 # Annealing diagnostics
 plot_anneal_history(history, os.path.join(PLOT_DIR, "anneal"))
 
 # Extra diagnostics requested
-plot_tier_counts(snap_final, os.path.join(PLOT_DIR, "tier_counts_final.png"), title="Tier composition (final)")
-plot_straightness_hist(snap_init, snap_final, os.path.join(PLOT_DIR, "straightness_hist_init_vs_final.png"), bins=30)
+plot_tier_counts(snap_final, os.path.join(PLOT_DIR, "tier_counts_final.pdf"), title="Tier composition (final)")
+plot_straightness_hist(snap_init, snap_final, os.path.join(PLOT_DIR, "straightness_hist_init_vs_final.pdf"), bins=30)
 
 print(f"\nSaved plots to: ./{PLOT_DIR}/")
-print("  assignment_initial.png")
-print("  assignment_final.png")
-print("  anneal_energy.png")
-print("  anneal_assigned.png")
-print("  anneal_accepted.png")
-print("  anneal_swap_types.png")
-print("  anneal_temperature.png")
-print("  tier_counts_final.png")
-print("  straightness_hist_init_vs_final.png")
+print("  assignment_initial.pdf")
+print("  assignment_final.pdf")
+print("  anneal_energy.pdf")
+print("  anneal_assigned.pdf")
+print("  anneal_accepted.pdf")
+print("  anneal_swap_types.pdf")
+print("  anneal_temperature.pdf")
+print("  tier_counts_final.pdf")
+print("  straightness_hist_init_vs_final.pdf")
