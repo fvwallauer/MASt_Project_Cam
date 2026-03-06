@@ -24,7 +24,7 @@ os.makedirs(PLOT_DIR, exist_ok=True)
 # PLATE PARAMETERS
 # -----------------------------------------------
 n_retractors = 168  # 168
-r = 102.5  # mm, half of 205mm field
+r = 205  # mm, half of 205mm field
 n_tiers = 3
 n_fibres = n_retractors * n_tiers
 
@@ -33,7 +33,7 @@ angles = jnp.linspace(0, 2*jnp.pi, n_retractors, endpoint=False)  # placement of
 retractor_x = jnp.asarray(r * jnp.cos(angles))
 retractor_y = jnp.asarray(r * jnp.sin(angles))
 # fibre_span_allowed = jnp.asarray([r*0.4, r*0.7, r*1.3])  # for tiers 0,1,2 (low-high)
-fibre_span_allowed = jnp.asarray([r*(180/102.5), r*(190/102.5) , r*(200/102.5)]) # for tiers 0,1,2 (low-high)
+fibre_span_allowed = jnp.asarray([180, 190 , 200]) # for tiers 0,1,2 (low-high)
 phi_max = jnp.deg2rad(14)  # max bend angle
 
 # Button vertices in local fibre-target coordinates
