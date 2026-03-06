@@ -455,6 +455,13 @@ reachable_fibres_per_target = [
 avg_nfib = np.mean([len(fibs) for fibs in reachable_fibres_per_target])
 print("Average fibres per target:", avg_nfib)
 
+reachable_targets_per_fibre = [
+    np.where(allowed_np[f, :])[0].astype(np.int32)
+    for f in range(allowed_np.shape[0])
+]
+avg_ntarg = np.mean([len(targs) for targs in reachable_targets_per_fibre])
+print("Average targets per fibre:", avg_ntarg)
+
 max_F = max(len(fibs) for fibs in reachable_fibres_per_target)
 print("Max fibres per target:", max_F)
 
