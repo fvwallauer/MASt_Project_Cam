@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 import random
@@ -18,23 +19,24 @@ plt.rc('ytick', labelsize=15)
 # =============================================================================
 # OUTPUT DIRECTORY FOR PLOTS
 # =============================================================================
-PLOT_DIR = "plots"
+PLOT_DIR = "plots_testfield_seed42_seed123"
 os.makedirs(PLOT_DIR, exist_ok=True)
 
 # ===============================================
 # PLATE PARAMETERS
 # -----------------------------------------------
-n_retractors = 158 # 168
+n_retractors = 168 # 168
 
 # Field radius remains the actual science field edge
 field_radius = 205  # mm, edge of field
-r = field_radius      # keep r for backwards compatibility with your existing code/comments
+r = field_radius
 
 n_tiers = 3
 n_fibres = n_retractors * n_tiers
 
 # Retractor coordinates & constraints
 angles = jnp.linspace(0, 2*jnp.pi, n_retractors, endpoint=False)  # placement angle of each retractor sector
+edge_clearance = 6.1  # mm
 
 # -----------------------------------------------------------------
 # tier-dependent fibre pivot radii (actual fibre draw points, via Gavin Dalton)
@@ -82,7 +84,7 @@ min_sep = 2  # mm; min. distance of separation below which buttons overlap
 # -----------------------------------------------
 # FIELD PARAMETERS
 # -----------------------------------------------
-n_targets = 1400  # 1400
+n_targets = 735  # 1400
 
 # ===============================================
 
@@ -145,8 +147,16 @@ def TF_reach_matrix(px, py):
     # -----------------------------------------------------------------
     # NEW: bend angle constraint is now tier-dependent
     # -----------------------------------------------------------------
-    allowed = (v_len <= span_allowed) & (ang <= phi_allowed)
+    target_r = jnp.sqrt(px**2 + py**2)                    # (T,)
+    target_inside_safe_region = target_r <= (field_radius - edge_clearance)
+
+    allowed = (
+        (v_len <= span_allowed) &
+        (ang <= phi_allowed) &
+        target_inside_safe_region[None, :]
+    )
     return allowed
+
 
 @jit
 def all_button_vertices(px, py, allowed):
@@ -443,6 +453,8 @@ def batch_collision_blocks(target_vertices, target_fibre_start, target_fibre_dir
 # ================================================
 # COLLISION MATRIX
 # ================================================
+collision_build_start = time.perf_counter() # to time!
+
 fibre_ids = jnp.arange(n_fibres)
 r_id_for_fibre = fibre_ids // n_tiers
 t_id_for_fibre = fibre_ids % n_tiers
@@ -551,7 +563,7 @@ pairs = np.stack([pairs_i, pairs_j], axis=1).astype(np.int32)
 
 print("Unique pairs needing fibre-level checks:", len(pairs))
 
-B = 32
+B = 256
 pairs_j_list = []
 blocks_j_list = []
 
@@ -571,6 +583,10 @@ for i in tqdm(range(0, len(pairs), B), desc="Building fibre-level collision bloc
 
     pairs_j_list.append(jnp.array(batch, dtype=jnp.int32))
     blocks_j_list.append(blocks_full)
+
+collision_build_end = time.perf_counter()
+collision_build_time = collision_build_end - collision_build_start
+print(f"Collision matrix build time: {collision_build_time:.3f} s")
 
 pairs_j = jnp.concatenate(pairs_j_list, axis=0)
 blocks_j = jnp.concatenate(blocks_j_list, axis=0)
@@ -695,29 +711,78 @@ for t in range(n_targets):
 _rng_pri = np.random.default_rng(99)
 priorities = np.where(_rng_pri.random(n_targets) > 0.5, 10.0, 1.0)
 
-# Straightness precompute
-straightness = np.zeros((n_targets, max_F), dtype=np.float32)
-phi_max_per_tier_np = np.deg2rad(np.array([9.0, 14.1, 14.1], dtype=np.float32))
+# # Straightness precompute
+# straightness = np.zeros((n_targets, max_F), dtype=np.float32)
+# phi_max_per_tier_np = np.deg2rad(np.array([9.0, 14.1, 14.1], dtype=np.float32))
 
-for t in range(n_targets):
-    for s in range(max_F):
-        if not target_fibre_mask[t, s]:
-            continue
-        f = int(target_fibre_ids[t, s])
+# for t in range(n_targets):
+#     for s in range(max_F):
+#         if not target_fibre_mask[t, s]:
+#             continue
+#         f = int(target_fibre_ids[t, s])
 
-        # -----------------------------------------------------------------
-        # NEW: straightness must be computed from the actual pivot position
-        # and normalised by the tier-specific angular limit
-        # -----------------------------------------------------------------
-        vx = px_np[t] - pivot_x_np[f]
-        vy = py_np[t] - pivot_y_np[f]
+#         # -----------------------------------------------------------------
+#         # NEW: straightness must be computed from the actual pivot position
+#         # and normalised by the tier-specific angular limit
+#         # -----------------------------------------------------------------
+#         vx = px_np[t] - pivot_x_np[f]
+#         vy = py_np[t] - pivot_y_np[f]
 
-        rx, ry = -pivot_x_np[f], -pivot_y_np[f]
-        cos_a = (vx*rx + vy*ry) / (np.hypot(vx, vy) * np.hypot(rx, ry) + 1e-12)
-        ang = np.arccos(np.clip(cos_a, -1, 1))
+#         rx, ry = -pivot_x_np[f], -pivot_y_np[f]
+#         cos_a = (vx*rx + vy*ry) / (np.hypot(vx, vy) * np.hypot(rx, ry) + 1e-12)
+#         ang = np.arccos(np.clip(cos_a, -1, 1))
 
-        tier = int(t_id_np[f])
-        straightness[t, s] = ang / phi_max_per_tier_np[tier]
+#         tier = int(t_id_np[f])
+#         straightness[t, s] = ang / phi_max_per_tier_np[tier]
+
+@jax.jit
+def compute_straightness(px, py, pivot_x, pivot_y, target_fibre_ids, target_fibre_mask):
+    tx = px[:, None]
+    ty = py[:, None]
+
+    # Safe fibre IDs for padded entries:
+    # where a slot is invalid, temporarily use fibre 0 & mask out later
+    fids_safe = jnp.where(target_fibre_mask, target_fibre_ids, 0)
+
+    # Pivot coordinates for each (target, slot) pair
+    px_f = pivot_x[fids_safe]
+    py_f = pivot_y[fids_safe]
+
+    # Fibre direction at the target: vector from target to pivot
+    gx = px_f - tx
+    gy = py_f - ty
+
+    # Pivot-target distance
+    gnorm = jnp.sqrt(gx**2 + gy**2)
+
+    # Unit fibre direction at the target
+    gx_unit = jnp.where(gnorm > 1e-12, gx / gnorm, 0)
+    gy_unit = jnp.where(gnorm > 1e-12, gy / gnorm, 0)
+
+    # Local normal at the target:
+    # radial direction from field centre to target
+    target_r = jnp.sqrt(tx**2 + ty**2)
+    nx = jnp.where(target_r > 1e-12, tx / target_r, 0)
+    ny = jnp.where(target_r > 1e-12, ty / target_r, 0)
+
+    # cos(theta_gate) = dot(fibre direction, local normal)
+    cos_theta = jnp.clip(gx_unit * nx + gy_unit * ny, -1.0, 1.0)
+
+    # sin^2(theta_gate)
+    sin2_theta = 1.0 - cos_theta**2
+
+    # d = distance to the target in units of the field radius
+    d_norm = target_r / field_radius
+
+    # Straightness definition:
+    # s = d * sin(theta_gate)^2
+    straightness = d_norm * sin2_theta
+
+    # Zero out invalid padded slots
+    straightness = jnp.where(target_fibre_mask, straightness, 0.0)
+
+    return straightness
+
 
 # Collision lookup
 def collides(ti, si, tj, sj):
@@ -804,7 +869,7 @@ def unassign_target(t):
     return int(f), int(s)
 
 # Energy
-UNASSIGNED_PENALTY = 2.0
+UNASSIGNED_PENALTY = 0 # 2
 
 def energy_single(t, s):
     return (1.0 + straightness[t, s]) / priorities[t]
@@ -875,8 +940,9 @@ def plot_assignment(snapshot, filename, title="Assignment"):
     ax.scatter(
         pivot_x_np,
         pivot_y_np,
-        s=8,
+        s=3,
         alpha=0.9,
+        c='k',
         label="Fibre pivots"
     )
 
@@ -884,18 +950,20 @@ def plot_assignment(snapshot, filename, title="Assignment"):
     ax.scatter(
         px_np[assigned_targets],
         py_np[assigned_targets],
-        s=2,
+        s=0.8,
         alpha=0.9,
-        label="Assigned targets"
+        label="Assigned targets",
+        c='deeppink'
     )
 
     # Unassigned targets
     ax.scatter(
         px_np[unassigned_targets],
         py_np[unassigned_targets],
-        s=2,
+        s=0.8,
         alpha=0.3,
-        label="Unassigned targets"
+        label="Unassigned targets",
+        c='cornflowerblue'
     )
 
     # Fibre paths and button footprints
@@ -911,7 +979,8 @@ def plot_assignment(snapshot, filename, title="Assignment"):
             [start[0], end[0]],
             [start[1], end[1]],
             linewidth=0.2,
-            alpha=0.5
+            c='k',
+            alpha=0.6
         )
 
         # button footprint
@@ -924,7 +993,7 @@ def plot_assignment(snapshot, filename, title="Assignment"):
             )
         )
 
-    circ = plt.Circle((0, 0), field_radius, fill=False, linewidth=1.5, alpha=0.8)
+    circ = plt.Circle((0, 0), field_radius, fill=False, linewidth=1.5, alpha=0.3, edgecolor='silver')
     ax.add_patch(circ)
 
     ax.set_aspect("equal", adjustable="box")
@@ -932,13 +1001,13 @@ def plot_assignment(snapshot, filename, title="Assignment"):
     # -----------------------------------------------------------------
     # NEW: show full pivot ring as well as the science field
     # -----------------------------------------------------------------
-    ax.set_xlim(plot_radius, -plot_radius)
-    ax.set_ylim(plot_radius, -plot_radius)
+    ax.set_xlim(-plot_radius, plot_radius)
+    ax.set_ylim(-plot_radius, plot_radius + 30)
 
     ax.set_xlabel("x [mm]")
     ax.set_ylabel("y [mm]")
     ax.set_title(f"{title}\nassigned fibres: {len(assigned_targets)}/{n_fibres}")
-    ax.legend(loc="upper right", fontsize=10)
+    ax.legend(loc="upper center", fontsize=10, ncol=3)
     fig.tight_layout()
     fig.savefig(filename)
     plt.close(fig)
@@ -1015,7 +1084,7 @@ def plot_tier_counts(snapshot, filename, title="Tier composition"):
     ax.set_ylabel("Assigned fibres")
     ax.set_title(title)
     fig.tight_layout()
-    fig.savefig(filename, dpi=200)
+    fig.savefig(filename)
     plt.close(fig)
 
 def _assigned_straightness_values(snapshot):
@@ -1035,45 +1104,72 @@ def _assigned_straightness_values(snapshot):
     vals = vals[np.isfinite(vals)]
     return vals.astype(np.float32)
 
-def plot_straightness_hist(snapshot_init, snapshot_final, filename, bins=30):
+def plot_straightness_hist(snapshot_init, snapshot_final, filename, bins=20):
     """
     Histogram comparing straightness distribution of assigned placements:
     init vs final.
     """
+    # Fix: Point to the correct helper function from your script
     v0 = _assigned_straightness_values(snapshot_init)
     v1 = _assigned_straightness_values(snapshot_final)
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    if len(v0) > 0:
-        ax.hist(v0, bins=bins, alpha=0.5, label="initial")
-    if len(v1) > 0:
-        ax.hist(v1, bins=bins, alpha=0.5, label="final")
+    bin_edges = np.linspace(0.0, 0.4, bins + 1)
 
-    ax.set_xlabel("straightness = (bend angle) / phi_max")
-    ax.set_ylabel("count")
-    ax.set_title("Straightness distribution of assigned fibres")
-    ax.legend()
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+
+    # Choice: Use a 'step' plot for the initial state to act as a reference 
+    # and a filled plot for the final state to show the result clearly.
+    if len(v0) > 0: # initial
+        ax.hist(v0, bins=bin_edges, color='cornflowerblue', alpha=0.5, edgecolor="royalblue", 
+                label="Initial", linewidth=0.7)
+
+    if len(v1) > 0: # final
+        ax.hist(v1, bins=bin_edges, color='deeppink', alpha=0.2, 
+                label="Final", edgecolor='mediumvioletred', linewidth=0.7)
+
+    # Choice: Clean up LaTeX formatting for the axis label
+    ax.set_xlabel(r"Straightness $s = d \sin^2(\theta_{\text{gate}})$")
+    ax.set_ylabel("Count")
+    ax.set_title("Fibre Straightness Optimization (Init vs. Final)")
+
+    # Ensure limits match the bin range exactly
+    ax.set_xlim(0, 0.4) 
+    
+    # Visual flair: remove top/right spines for a cleaner look
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.grid(axis='y', linestyle='--', alpha=0.3)
+
+    ax.legend(frameon=False)
     fig.tight_layout()
-    fig.savefig(filename, dpi=200)
+    fig.savefig(filename, dpi=300)
     plt.close(fig)
+
 
 # =============================================================================
 # ANNEALING (returns history)
 # =============================================================================
-def anneal(T_i=10.0, T_f=0.1, delta_T=0.01, max_iters=20, seed=42, return_history=True):
+def anneal(T_i=200, T_f=50, delta_T=0.01, max_iters=20, seed=42, return_history=True):
     rng = np.random.default_rng(seed)
     T = float(T_i)
     n_steps = 0
     n_accepted = 0
     swap_counts = {1: 0, 2: 0, 3: 0, 4: 0}
 
-    history = {"T": [], "E": [], "assigned": [], "accepted": [],
-               "swap1": [], "swap2": [], "swap3": [], "swap4": []}
+    history = {
+        "T": [], "E": [], "assigned": [], "accepted": [],
+        "swap1": [], "swap2": [], "swap3": [], "swap4": [],
+        "step_time_s": []
+    }
+
+    anneal_start = time.perf_counter()
 
     best_E = energy_total()
     print(f"Initial state: E={best_E:.2f}, T={T:.4f}, assigned={int(np.sum(fibre_to_target >= 0))}")
 
     while T > T_f:
+        step_start = time.perf_counter()
+
         for _ in range(max_iters):
             for fibre_a in rng.permutation(n_fibres):
                 fibre_a = int(fibre_a)
@@ -1146,14 +1242,16 @@ def anneal(T_i=10.0, T_f=0.1, delta_T=0.01, max_iters=20, seed=42, return_histor
                 if accepted_flag:
                     n_accepted += 1
 
-        # cool
         T *= (1.0 - delta_T)
 
-        # record (once per temperature step)
         cur_E = energy_total()
         n_assigned = int(np.sum(fibre_to_target >= 0))
+        step_time = time.perf_counter() - step_start
 
-        print(f"  T={T:.4f}  E={cur_E:.2f}  assigned={n_assigned}  accepted={n_accepted}  steps={n_steps}")
+        print(
+            f"  T={T:.4f}  E={cur_E:.2f}  assigned={n_assigned}  "
+            f"accepted={n_accepted}  steps={n_steps}  step_time={step_time:.3f} s"
+        )
 
         history["T"].append(float(T))
         history["E"].append(float(cur_E))
@@ -1163,22 +1261,70 @@ def anneal(T_i=10.0, T_f=0.1, delta_T=0.01, max_iters=20, seed=42, return_histor
         history["swap2"].append(int(swap_counts[2]))
         history["swap3"].append(int(swap_counts[3]))
         history["swap4"].append(int(swap_counts[4]))
+        history["step_time_s"].append(float(step_time))
+
+    anneal_total_time = time.perf_counter() - anneal_start
 
     print(f"\nAnnealing complete. Swap counts: {swap_counts}")
     print(f"Final: E={energy_total():.2f}, assigned={int(np.sum(fibre_to_target >= 0))}/{n_fibres}")
+    print(f"Total annealing time: {anneal_total_time:.3f} s")
+
+    if return_history:
+        history["total_time_s"] = anneal_total_time
 
     return history if return_history else None
 
 # =============================================================================
 # RUN + SAVE FIGURES
 # =============================================================================
+straightness = compute_straightness(
+    px, py, pivot_x, pivot_y,
+    jnp.array(target_fibre_ids),
+    jnp.array(target_fibre_mask)
+)
+
 reset_state()
-init_assignment(seed=42)
+init_assignment(seed=42) # seed=42 default
 snap_init = snapshot_state()
 print(f"Initial energy: {energy_total():.2f}\n")
 
-history = anneal(T_i=10.0, T_f=0.1, delta_T=0.01, max_iters=20, seed=123, return_history=True)
+history = anneal(T_i=200, T_f=50, delta_T=0.01, max_iters=20, seed=123, return_history=True) # seed=123 default
 snap_final = snapshot_state()
+
+# ------------------------------------------------
+# SAVE FIELD PARAMETERS IN OUTPUT DIR
+#-------------------------------------------------
+directory = PLOT_DIR
+filename = "summary.txt"
+filepath = os.path.join(directory, filename)
+
+with open(filepath, "w") as f:
+    f.write(f"# Retractors: {n_retractors}\n")
+    f.write(f"# Fibres: {n_fibres}\n")
+    f.write(f"# Targets: {n_targets}\n")
+    f.write(f"Unassigned penalty: {UNASSIGNED_PENALTY}\n")
+    f.write(f"Field radius: {field_radius}\n")
+    f.write(f"Edge clearance: {edge_clearance}\n")
+    f.write(f"Allowed fibre span per tier: {fibre_span_allowed}\n")
+    f.write(f"Max fibres per target: {max_F}\n")
+    f.write(f"Average targets per fibre: {avg_ntarg}\n")
+    f.write(f"Average fibres per target: {avg_nfib}\n")
+    f.write(f"Pairs needing fibre-level checks: {int(needs_fibre_level.sum()/2)}\n")
+    f.write("\n")
+    f.write("Timing information\n")
+    f.write("------------------\n")
+    f.write(f"Collision matrix build time [s]: {collision_build_time:.6f}\n")
+    f.write(f"Total annealing time [s]: {history['total_time_s']:.6f}\n")
+    f.write(f"Mean annealing step time [s]: {np.mean(history['step_time_s']):.6f}\n")
+    f.write(f"Min annealing step time [s]: {np.min(history['step_time_s']):.6f}\n")
+    f.write(f"Max annealing step time [s]: {np.max(history['step_time_s']):.6f}\n")
+
+    f.write("Annealing step times [s] per temperature step:\n")
+    for i, (temp, dt) in enumerate(zip(history["T"], history["step_time_s"])):
+        f.write(f"  step {i:4d}  T={temp:.6f}  time={dt:.6f}\n")
+
+print(f"{filename} saved to {filepath}")
+
 
 # Main configuration plots
 plot_assignment(snap_init, os.path.join(PLOT_DIR, "assignment_initial.pdf"), title="Initial greedy assignment")
@@ -1189,7 +1335,7 @@ plot_anneal_history(history, os.path.join(PLOT_DIR, "anneal"))
 
 # Extra diagnostics requested
 plot_tier_counts(snap_final, os.path.join(PLOT_DIR, "tier_counts_final.pdf"), title="Tier composition (final)")
-plot_straightness_hist(snap_init, snap_final, os.path.join(PLOT_DIR, "straightness_hist_init_vs_final.pdf"), bins=30)
+plot_straightness_hist(snap_init, snap_final, os.path.join(PLOT_DIR, "straightness_hist_init_vs_final.pdf"))
 
 print(f"\nSaved plots to: ./{PLOT_DIR}/")
 print("  assignment_initial.pdf")
